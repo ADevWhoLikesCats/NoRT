@@ -1,0 +1,293 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, binding = 0) uniform image2D outImage;
+
+struct Light { vec4 position; vec4 color; };
+layout(std140, binding = 1) uniform CameraUBO {
+    mat4 invViewProj;
+    mat4 invModel;
+    mat4 model;
+    mat4 normalMatrix;
+    vec4 camPosWorld;
+    Light lights[3];
+} cam;
+
+struct Vtx { vec4 pos; vec4 albedo; vec4 mr; };
+layout(std430, binding = 2) buffer Verts { Vtx verts[]; };
+
+struct BVHNode { vec4 aabbMin; vec4 aabbMax; int leftOrStart; int rightOrCount; };
+layout(std430, binding = 3) buffer Nodes { BVHNode nodes[]; };
+
+const float PI = 3.14159265359;
+const int   MAX_BOUNCES = 6;
+const int   GI_SAMPLES  = 2;
+const vec3  BG          = vec3(0.03, 0.03, 0.05);
+
+// ---------- PBR (unchanged) ----------
+float distributionGGX(vec3 N, vec3 H, float r) {
+    float a=r*r, a2=a*a;
+    float NdotH=max(dot(N,H),0.0);
+    float d=(NdotH*NdotH*(a2-1.0)+1.0); d=PI*d*d;
+    return a2/max(d,1e-6);
+}
+float geometrySchlickGGX(float NdotV, float r) {
+    float rr=r+1.0, k=(rr*rr)/8.0;
+    return NdotV/(NdotV*(1.0-k)+k);
+}
+float geometrySmith(vec3 N, vec3 V, vec3 L, float r) {
+    return geometrySchlickGGX(max(dot(N,V),0.0),r) * geometrySchlickGGX(max(dot(N,L),0.0),r);
+}
+vec3 fresnelSchlick(float c, vec3 F0) { return F0+(1.0-F0)*pow(clamp(1.0-c,0.0,1.0),5.0); }
+
+// ---------- RNG ----------
+uint hashSeed(uvec2 px) {
+    uint h=px.x*1973u+px.y*9277u+26699u;
+    h=(h^61u)^(h>>16u); h=h*9u; h=h^(h>>4u); h=h*0x27d4eb2du;
+    return h^(h>>15u);
+}
+float rand(inout uint s) {
+    s=s*747796405u+2891336453u;
+    uint w=((s>>((s>>28u)+4u))^s)*277803737u;
+    return float((w>>22u)^w)/4294967296.0;
+}
+vec3 randHemisphere(vec3 N, inout uint s) {
+    float u1=rand(s), u2=rand(s);
+    float r=sqrt(u1), th=2.0*PI*u2;
+    vec3 lp=vec3(r*cos(th),r*sin(th),sqrt(max(0.0,1.0-u1)));
+    vec3 up=abs(N.z)<0.999?vec3(0,0,1):vec3(1,0,0);
+    vec3 T=normalize(cross(up,N)), B=cross(N,T);
+    return normalize(T*lp.x+B*lp.y+N*lp.z);
+}
+
+// ---------- Intersect ----------
+bool hitTri(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2, out float t, out vec3 ng) {
+    vec3 e1=v1-v0, e2=v2-v0;
+    vec3 p=cross(rd,e2);
+    float det=dot(e1,p);
+    if (abs(det)<1e-8) return false;
+    float invDet=1.0/det;
+    vec3 tv=ro-v0;
+    float u=dot(tv,p)*invDet;
+    if (u<0.0||u>1.0) return false;
+    vec3 q=cross(tv,e1);
+    float v=dot(rd,q)*invDet;
+    if (v<0.0||u+v>1.0) return false;
+    t=dot(e2,q)*invDet;
+    ng=normalize(cross(e1,e2));
+    return t>1e-4;
+}
+bool slabTest(vec3 ro, vec3 invD, vec4 bmin, vec4 bmax, float tMax, out float tEnter) {
+    vec3 t0=(bmin.xyz-ro)*invD, t1=(bmax.xyz-ro)*invD;
+    vec3 tmin=min(t0,t1), tmax=max(t0,t1);
+    float tn=max(max(tmin.x,tmin.y),max(tmin.z,0.0));
+    float tf=min(min(tmax.x,tmax.y),min(tmax.z,tMax));
+    tEnter=tn;
+    return tf>=tn;
+}
+
+struct Hit { float t; int tri; vec3 ng; };
+
+Hit traceClosest(vec3 ro, vec3 rd, float tMax) {
+    Hit h; h.t=tMax; h.tri=-1; h.ng=vec3(0.0);
+    vec3 invD=1.0/rd;
+    int stack[32]; int sp=0; stack[sp++]=0;
+    while (sp>0) {
+        int ni=stack[--sp];
+        BVHNode n=nodes[ni];
+        float tEnter;
+        if (!slabTest(ro,invD,n.aabbMin,n.aabbMax,h.t,tEnter)) continue;
+        if (n.rightOrCount<0) {
+            int start=n.leftOrStart, count=-n.rightOrCount;
+            for (int i=0;i<count;i++) {
+                int t=start+i;
+                vec3 v0=verts[t*3+0].pos.xyz;
+                vec3 v1=verts[t*3+1].pos.xyz;
+                vec3 v2=verts[t*3+2].pos.xyz;
+                float tt; vec3 ng;
+                if (hitTri(ro,rd,v0,v1,v2,tt,ng) && tt<h.t) {
+                    h.t=tt; h.tri=t; h.ng=ng;
+                }
+            }
+        } else {
+            stack[sp++]=n.rightOrCount;
+            stack[sp++]=n.leftOrStart;
+        }
+    }
+    return h;
+}
+
+bool traceOcclusion(vec3 ro, vec3 rd, float tMax) {
+    vec3 invD=1.0/rd;
+    int stack[32]; int sp=0; stack[sp++]=0;
+    while (sp>0) {
+        int ni=stack[--sp];
+        BVHNode n=nodes[ni];
+        float tEnter;
+        if (!slabTest(ro,invD,n.aabbMin,n.aabbMax,tMax,tEnter)) continue;
+        if (n.rightOrCount<0) {
+            int start=n.leftOrStart, count=-n.rightOrCount;
+            for (int i=0;i<count;i++) {
+                int t=start+i;
+                vec3 v0=verts[t*3+0].pos.xyz;
+                vec3 v1=verts[t*3+1].pos.xyz;
+                vec3 v2=verts[t*3+2].pos.xyz;
+                float tt; vec3 ng;
+                if (hitTri(ro,rd,v0,v1,v2,tt,ng) && tt<tMax) return true;
+            }
+        } else {
+            stack[sp++]=n.rightOrCount;
+            stack[sp++]=n.leftOrStart;
+        }
+    }
+    return false;
+}
+
+// ---------- Direct lighting with shadows at a model-space hit ----------
+vec3 shadeDirect(vec3 P_model, vec3 rd_model, Hit h) {
+    vec3 P_world = (cam.model * vec4(P_model, 1.0)).xyz;
+    vec3 N_world = normalize(mat3(cam.normalMatrix) * h.ng);
+    vec3 rdW     = normalize((cam.model * vec4(rd_model, 0.0)).xyz);
+    if (dot(N_world, rdW) > 0.0) N_world = -N_world;
+
+    vec3 V = -rdW;
+    vec3 albedo = verts[h.tri*3].albedo.rgb;
+    float metal = verts[h.tri*3].mr.x;
+    float rough = clamp(verts[h.tri*3].mr.y, 0.04, 1.0);
+
+    vec3 F0 = mix(vec3(0.04), albedo, metal);
+    vec3 kD = (1.0 - fresnelSchlick(max(dot(N_world,V),0.0),F0)) * (1.0 - metal);
+
+    vec3 N_model = normalize(mat3(cam.invModel) * N_world);
+
+    vec3 Lo = vec3(0.0);
+    for (int i = 0; i < 3; ++i) {
+        vec3 Lw = normalize(cam.lights[i].position.xyz - P_world);
+        float distToLight = length(cam.lights[i].position.xyz - P_world);
+        vec3 Lm = normalize((cam.invModel * vec4(Lw, 0.0)).xyz);
+
+        // Shadow: opaque-only. Glass casts blocky shadows (approx).
+        bool occluded = traceOcclusion(P_model + N_model*1e-3, Lm, distToLight*1.001);
+        if (occluded) continue;
+
+        vec3 H = normalize(V + Lw);
+        float D = distributionGGX(N_world, H, rough);
+        float G = geometrySmith(N_world, V, Lw, rough);
+        vec3  F = fresnelSchlick(max(dot(H,V),0.0), F0);
+        vec3  spec = (D*G*F)/(4.0*max(dot(N_world,V),0.0)*max(dot(N_world,Lw),0.0)+1e-6);
+        float NdotL = max(dot(N_world,Lw),0.0);
+        float atten = 1.0/(distToLight*distToLight);
+        Lo += (kD*albedo/PI + spec) * cam.lights[i].color.rgb * atten * NdotL;
+    }
+    return Lo;
+}
+
+void main() {
+    ivec2 px   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    vec2 ndc = vec2(
+        (2.0*(px.x+0.5))/float(size.x)-1.0,
+        (2.0*(px.y+0.5))/float(size.y)-1.0
+    );
+
+    vec4 farH = cam.invViewProj * vec4(ndc, 1.0, 1.0);
+    vec3 farW = farH.xyz / farH.w;
+    vec3 roW  = cam.camPosWorld.xyz;
+    vec3 rdW  = normalize(farW - roW);
+
+    vec4 roH = cam.invModel * vec4(roW, 1.0);
+    vec4 rdH = cam.invModel * vec4(rdW, 0.0);
+    vec3 ro  = roH.xyz;
+    vec3 rd  = rdH.xyz;
+
+    uint rng = hashSeed(uvec2(px));
+    rng ^= uint(gl_NumWorkGroups.x * 1000003u + gl_NumWorkGroups.y);
+
+    vec3 color      = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    // Loop-based path. MAX_BOUNCES iterations, not recursion.
+    for (int bounce = 0; bounce < MAX_BOUNCES + 1; ++bounce) {
+        Hit h = traceClosest(ro, rd, 1e30);
+        if (h.tri < 0) { color += throughput * BG; break; }
+
+        vec3 P_model = ro + rd * h.t;
+        vec3 rdW     = normalize((cam.model * vec4(rd, 0.0)).xyz);
+        vec3 N_world = normalize(mat3(cam.normalMatrix) * h.ng);
+        if (dot(N_world, rdW) > 0.0) N_world = -N_world;
+
+        vec3 albedo = verts[h.tri*3].albedo.rgb;
+        float metal = verts[h.tri*3].mr.x;
+        float rough = clamp(verts[h.tri*3].mr.y, 0.04, 1.0);
+        bool isMirror = metal > 0.9 && rough < 0.1;
+        bool isGlass  = metal < 0.1 && rough < 0.05;
+
+        // Direct lighting contributes only for non-mirror, non-glass surfaces.
+        // For mirror/glass, all light comes from the next bounce.
+        if (!isMirror && !isGlass) {
+            color += throughput * shadeDirect(P_model, rd, h);
+
+            // One-bounce diffuse GI (single sample per GI_SAMPLES)
+            if (bounce + 1 <= MAX_BOUNCES) {
+                vec3 N_model = normalize(mat3(cam.invModel) * N_world);
+                vec3 giAccum = vec3(0.0);
+                for (int s = 0; s < GI_SAMPLES; ++s) {
+                    vec3 dir = randHemisphere(N_model, rng);
+                    vec3 origin = P_model + N_model * 1e-3;
+                    Hit gh = traceClosest(origin, dir, 1e30);
+                    if (gh.tri < 0) continue;
+                    // Direct light on the GI hit only — no further GI (avoids recursion).
+                    vec3 gp = origin + dir * gh.t;
+                    giAccum += shadeDirect(gp, dir, gh);
+                }
+                giAccum /= float(GI_SAMPLES);
+                color += throughput * albedo * giAccum;
+            }
+            break;   // opaque surface, path ends here
+        }
+
+        if (isMirror) {
+            vec3 reflDir = reflect(rdW, N_world);
+            vec3 origin  = (cam.model * vec4(P_model, 1.0)).xyz + N_world * 1e-3;
+            throughput *= vec3(0.95, 0.95, 0.98);
+            ro = (cam.invModel * vec4(origin, 1.0)).xyz;
+            rd = (cam.invModel * vec4(reflDir, 0.0)).xyz;
+            continue;
+        }
+
+        // Glass: determine entry vs exit from the actual geometric normal.
+        // N_world faces toward rdW (we already flipped it above), so use a
+        // ray-to-original-normal test.
+        bool entering = dot(rdW, normalize(mat3(cam.normalMatrix) * h.ng)) < 0.0;
+        vec3 Ng = entering ? -N_world : N_world;   // normal facing the ray
+        float eta = entering ? (1.0/1.5) : 1.5;
+
+        vec3 V = -rdW;
+        float cosI = clamp(dot(-V, Ng), 0.0, 1.0);
+        float cosT2 = 1.0 - eta*eta*(1.0 - cosI*cosI);
+        bool tir = cosT2 < 0.0;
+        float F0 = 0.04;
+        float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+        if (tir) fresnel = 1.0;
+
+        bool doReflect = tir || (rand(rng) < fresnel);
+        vec3 newDirW;
+        if (doReflect) {
+            newDirW = reflect(rdW, Ng);
+            throughput *= vec3(1.0);
+        } else {
+            newDirW = normalize(eta * rdW + (eta * cosI - sqrt(cosT2)) * Ng);
+            throughput *= albedo;   // glass tint absorbed
+        }
+        vec3 originW = (cam.model * vec4(P_model, 1.0)).xyz
+                     + (entering ? N_world : -N_world) * 1e-3;
+        ro = (cam.invModel * vec4(originW, 1.0)).xyz;
+        rd = (cam.invModel * vec4(newDirW, 0.0)).xyz;
+    }
+
+    color = color / (color + vec3(1.0));
+    color = pow(color, vec3(1.0/2.2));
+    imageStore(outImage, px, vec4(color, 1.0));
+}
