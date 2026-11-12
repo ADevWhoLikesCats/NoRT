@@ -11,9 +11,7 @@ Makefile
 *.spv
 
 # Backup files created during development
-*.bak
-*.bak_*
-*.orig
+*bak*
 
 # Large model files (download separately, not part of the repo)
 suzanne.obj
