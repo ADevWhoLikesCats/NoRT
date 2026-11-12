@@ -1,3 +1,0 @@
-/home/hrishikesh/Downloads/VULKAN/build/CMakeFiles/VulkanSpinningCube.dir
-/home/hrishikesh/Downloads/VULKAN/build/CMakeFiles/edit_cache.dir
-/home/hrishikesh/Downloads/VULKAN/build/CMakeFiles/rebuild_cache.dir
