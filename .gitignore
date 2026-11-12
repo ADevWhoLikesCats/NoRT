@@ -1,0 +1,35 @@
+# Build artifacts
+VulkanTest
+build/
+*.o
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled shaders (rebuilt from .comp / .vert / .frag)
+*.spv
+
+# Backup files created during development
+*.bak
+*.bak_*
+*.orig
+
+# Large model files (download separately, not part of the repo)
+suzanne.obj
+*.obj
+
+# Screenshots and generated images — but keep the one in the README
+*.png
+!screenshot.png
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
