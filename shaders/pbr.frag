@@ -47,7 +47,7 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 
 void main() {
     vec3  N         = normalize(fragNormal);
-    vec3  V         = normalize(ubo.camPos - fragWorldPos);
+    vec3  V         = normalize(ubo.camPos.xyz - fragWorldPos);
     vec3  albedo    = fragAlbedo;
     float metallic  = fragMetallic;
     float roughness = clamp(fragRoughness, 0.04, 1.0);
